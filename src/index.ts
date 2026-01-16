@@ -8,6 +8,8 @@ import {
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import axios, { AxiosInstance } from "axios";
+import { Agent as HttpAgent } from "http";
+import { Agent as HttpsAgent } from "https";
 
 // Environment variables
 const BRINQA_API_URL = process.env.BRINQA_API_URL || "";
@@ -30,6 +32,23 @@ interface GraphQLResponse<T> {
   }>;
 }
 
+// Create singleton HTTP/HTTPS agents with connection pooling
+const httpAgent = new HttpAgent({
+  keepAlive: true,
+  keepAliveMsecs: 30000, // 30 seconds
+  maxSockets: 50,
+  maxFreeSockets: 10,
+  timeout: 60000, // 60 seconds
+});
+
+const httpsAgent = new HttpsAgent({
+  keepAlive: true,
+  keepAliveMsecs: 30000,
+  maxSockets: 50,
+  maxFreeSockets: 10,
+  timeout: 60000,
+});
+
 class BrinqaClient {
   private baseUrl: string;
   private accessToken: string | null = null;
@@ -44,6 +63,9 @@ class BrinqaClient {
         "Content-Type": "application/json",
         Accept: "application/json",
       },
+      httpAgent,
+      httpsAgent,
+      timeout: 30000, // 30 second request timeout
     });
   }
 
@@ -483,19 +505,22 @@ function buildAssetsQuery(params: {
   const fields =
     params.fields?.join("\n        ") ||
     `id
-        name
+        displayName
         assetType
         status
-        criticality
-        riskScore
-        ipAddress
-        hostname
-        operatingSystem
+        baseRiskScore
+        riskRating
+        publicIpAddresses
+        macAddresses
+        os
+        firstSeen
         lastSeen
-        discoveredAt
-        owner
-        businessUnit
-        environment
+        openFindingCount
+        dataIntegrationTitles
+        owners {
+          name
+          emails
+        }
         tags`;
 
   const filters: string[] = [];
@@ -633,30 +658,22 @@ function buildFindingsQuery(params: {
         }
         nodes(first: ${limit}) {
           id
-          findingType
-          title
-          description
-          status
-          severity
-          riskScore
-          baseRiskScore
-          overallRiskScore
-          discoveredAt
-          lastSeenAt
-          resolvedAt
+          firstFound
+          connectorNames
+          riskRating
+          statusCategory
+          ageInDays
+          type {
+            name
+            openFindingCount
+            patchAvailable
+            recommendation
+          }
           asset {
             id
-            name
+            displayName
             assetType
           }
-          vulnerability {
-            id
-            cveId
-            title
-          }
-          assignee
-          dueDate
-          slaStatus
         }
       }
     }
@@ -912,19 +929,85 @@ function buildDataModelsQuery(params: {
   `;
 }
 
-// Main server setup
-async function main() {
-  if (!BRINQA_API_URL) {
-    console.error(
-      "Error: BRINQA_API_URL environment variable is required"
-    );
-    console.error(
-      "Please set BRINQA_API_URL to your Brinqa platform URL (e.g., https://your-instance.brinqa.net)"
-    );
-    process.exit(1);
+// Input validation helper
+function validateInput(value: unknown, fieldName: string, type: 'string' | 'number' | 'boolean' | 'array' | 'object'): void {
+  if (value === undefined || value === null) {
+    return; // Optional parameters
   }
 
-  const client = new BrinqaClient(BRINQA_API_URL);
+  if (type === 'string' && typeof value !== 'string') {
+    throw new Error(`${fieldName} must be a string`);
+  }
+  if (type === 'number' && typeof value !== 'number') {
+    throw new Error(`${fieldName} must be a number`);
+  }
+  if (type === 'boolean' && typeof value !== 'boolean') {
+    throw new Error(`${fieldName} must be a boolean`);
+  }
+  if (type === 'array' && !Array.isArray(value)) {
+    throw new Error(`${fieldName} must be an array`);
+  }
+  if (type === 'object' && (typeof value !== 'object' || Array.isArray(value))) {
+    throw new Error(`${fieldName} must be an object`);
+  }
+
+  // Check for potential injection patterns in strings
+  if (type === 'string' && typeof value === 'string') {
+    // Prevent GraphQL injection attempts
+    const dangerousPatterns = /(\$\{|\}\}|__typename|fragment\s+|mutation\s+{)/i;
+    if (dangerousPatterns.test(value)) {
+      throw new Error(`${fieldName} contains potentially unsafe characters`);
+    }
+  }
+}
+
+// Helper function to check credentials and return error response if missing
+function checkCredentials(): { error: true; response: { content: Array<{ type: "text"; text: string }>; isError: true } } | { error: false } {
+  if (!BRINQA_API_URL) {
+    return {
+      error: true,
+      response: {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({
+              error: "BRINQA_API_URL not configured",
+              message: "Please configure BRINQA_API_URL in ~/.claude/.claude.json under mcpServers.brinqa.env",
+              example: {
+                mcpServers: {
+                  brinqa: {
+                    command: "node",
+                    args: ["/path/to/brinqa-mcp/dist/index.js"],
+                    env: {
+                      BRINQA_API_URL: "https://your-instance.brinqa.net",
+                      BRINQA_API_KEY: "your-api-key"
+                    }
+                  }
+                }
+              }
+            }, null, 2),
+          },
+        ],
+        isError: true,
+      },
+    };
+  }
+  return { error: false };
+}
+
+// Create client lazily - only when needed
+function getClient(): BrinqaClient {
+  return new BrinqaClient(BRINQA_API_URL);
+}
+
+// Main server setup
+async function main() {
+  // Log startup information (but not credentials)
+  if (!BRINQA_API_URL) {
+    console.error("Warning: BRINQA_API_URL not configured. Server will start but tools will require configuration.");
+  } else {
+    console.error(`Brinqa MCP server connecting to: ${new URL(BRINQA_API_URL).origin}`);
+  }
 
   const server = new Server(
     {
@@ -947,6 +1030,14 @@ async function main() {
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
 
+    // Check credentials before executing any tool
+    const credCheck = checkCredentials();
+    if (credCheck.error) {
+      return credCheck.response;
+    }
+
+    const client = getClient();
+
     try {
       let result: unknown;
 
@@ -959,6 +1050,13 @@ async function main() {
             filter?: string;
             fields?: string[];
           };
+          // Validate inputs
+          validateInput(params.asset_type, 'asset_type', 'string');
+          validateInput(params.status, 'status', 'string');
+          validateInput(params.limit, 'limit', 'number');
+          validateInput(params.filter, 'filter', 'string');
+          validateInput(params.fields, 'fields', 'array');
+
           const query = buildAssetsQuery(params);
           result = await client.executeGraphQL(query);
           break;
@@ -1033,6 +1131,14 @@ async function main() {
             query: string;
             variables?: Record<string, unknown>;
           };
+          // Validate GraphQL query
+          validateInput(params.query, 'query', 'string');
+          validateInput(params.variables, 'variables', 'object');
+
+          if (!params.query || params.query.trim().length === 0) {
+            throw new Error('GraphQL query cannot be empty');
+          }
+
           result = await client.executeGraphQL(
             params.query,
             params.variables
